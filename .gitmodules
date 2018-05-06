@@ -1,0 +1,9 @@
+[submodule "kicad-automation-scripts"]
+	path = kicad-automation-scripts
+	url = git@github.com:productize/kicad-automation-scripts.git
+[submodule "kicad_automation_script"]
+	path = kicad_automation_script
+	url = git@github.com:productize/kicad-automation-scripts.git
+[submodule "kicad_automation_scripts"]
+	path = kicad_automation_scripts
+	url = git@github.com:productize/kicad-automation-scripts.git
