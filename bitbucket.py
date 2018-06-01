@@ -18,8 +18,7 @@ formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
 
 app = Flask(__name__)
 base = "/bitbucket-fileviewer"
-# TODO: automaticaly figure out address of connections-db
-connections_db = StrictRedis(host="172.18.0.2")
+connections_db = StrictRedis(host="connections-db")
 
 if "FILE_RENDERER_KEY" not in environ:
 	print("No FILE_RENDERER_KEY set")
