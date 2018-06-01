@@ -12,6 +12,10 @@ from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
 from kicad_automation_scripts.eeschema.export_schematic import export_schematic
 
+import logging
+formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
+                              datefmt='%Y-%m-%d %H:%M:%S')
+
 app = Flask(__name__)
 base = "/bitbucket-fileviewer"
 # TODO: automaticaly figure out address of connections-db
@@ -50,7 +54,7 @@ descriptor = {
 	"baseUrl": "https://blue.productize.be"+base,
 	"authentication": {
 		"type": "none"
-	}, # ToDo: Use JWT authentication and safely store secre,
+	}, # ToDo: Use JWT authentication and safely store secret
 	"lifecycle": {
 		"installed": "/installed",
 		"uninstalled": "/uninstalled",
@@ -139,7 +143,7 @@ def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(sec
 		"sub": connection
 	}, secret, algorithm='HS256')
 
-def list_files(connection, base_url, secret, path):
+def list_files(session, connection, base_url, secret, path):
 	params = {
 		"q": "path~\".sch\" or path~\".lib\"",
 		"pagelen": "50"
@@ -155,7 +159,7 @@ def list_files(connection, base_url, secret, path):
 
 	print(encoded_jwt)
 
-	r = requests.get(base_url+endpoint, params=params, headers={
+	r = session.get(base_url+endpoint, params=params, headers={
 		'Authorization': "JWT "+encoded_jwt.decode('utf-8'),
 	})
 
@@ -165,7 +169,7 @@ def list_files(connection, base_url, secret, path):
 
 	return r.json()["values"]
 
-def get_and_save_file(connection, base_url, secret, file_path):
+def get_and_save_file(session, connection, base_url, secret, file_path):
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{file_path}".format(
 		repo_path = urllib.parse.unquote(request.args.get("repo_path")),
 		node = request.args.get("cset"),
@@ -174,7 +178,7 @@ def get_and_save_file(connection, base_url, secret, file_path):
 
 	encoded_jwt = create_jwt(connection, secret, endpoint)
 
-	r = requests.get(base_url+endpoint, headers={
+	r = session.get(base_url+endpoint, headers={
 		'Authorization': "JWT "+encoded_jwt.decode('utf-8'),
 	})
 
@@ -231,6 +235,7 @@ def generate_pdf(pdf):
 			    pageNum = 1,
 			    pageRendering = false,
 			    pageNumPending = null,
+			    scale = 0.8,
 			    canvas = document.getElementById('the-canvas'),
 			    ctx = canvas.getContext('2d');
 
@@ -335,12 +340,13 @@ def schematic():
 	base_url = connections_db.get("/bitbucket/%s/api_url".format(connection)).decode("utf-8")
 
 	file_path = request.args.get("file_path")
-	files = list_files(connection, base_url, secret, path.dirname(file_path))
-	print(files)
-	for file in files:
-		# TODO: check if file already exists
-		# TODO: Do this async!
-		get_and_save_file(connection, base_url, secret, file["path"])
+
+	with requests.Session() as s:
+		files = list_files(s, connection, base_url, secret, path.dirname(file_path))
+		print(files)
+		for file in files:
+			# TODO: check if file already exists
+			get_and_save_file(s, connection, base_url, secret, file["path"])
 
 	# TODO: check if output file exists
 	full_file_path = "./tmp/{}".format(file_path)
