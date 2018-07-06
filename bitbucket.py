@@ -1,17 +1,25 @@
 
 import json
-from flask import Flask, request, Response
+from flask import Flask, request, Response, render_template, send_file
 import jwt
 from datetime import timezone, datetime, timedelta
 import urllib.parse
 from os import environ, path, makedirs
+import os
 from hashlib import sha256
 import requests
 from redis import StrictRedis
 from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
 from kicad_automation_scripts.eeschema.export_schematic import export_schematic
+try:
+	from secrets import token_hex as secret_token
+except ImportError:
+	from os import urandom
+	def secret_token(nbytes=None):
+		return urandom(nbytes).hex()
 
+ADDRESS="https://blue.productize.be"
 BASE_INPUT_DIR="/input"
 INPUT_DIR = BASE_INPUT_DIR+"/{cset}/{path}"
 BASE_OUTPUT_DIR = "./output"
@@ -65,7 +73,7 @@ descriptor = {
 		"name": "Productize",
 		"url": "https://productize.be",
 	},
-	"baseUrl": "https://blue.productize.be"+base,
+	"baseUrl": ADDRESS+base,
 	"authentication": {
 		"type": "jwt"
 	},
@@ -87,50 +95,91 @@ descriptor = {
 def install():
 	return json.dumps(descriptor)
 
+def get_connection(username):
+	return "/bitbucket.org/{}".format(username)
+
 @app.route(base+descriptor["lifecycle"]["installed"], methods=['POST'])
 def installed():
 	print(request.data)
 
 	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM)
 
-	connection = request.json["clientKey"]
+	connection = get_connection(request.json["user"]["username"])
 	connections_db.set(
-		"/bitbucket/{}/secret".format(connection),
+		connection+"/client_key",
+		request.json["clientKey"]
+	)
+	connections_db.set(
+		connection+"/secret",
 		cipher.encrypt(request.json["sharedSecret"].encode("utf-8"))
 	)
 	connections_db.set(
-		"/bitbucket/{}/nonce".format(connection),
+		connection+"/nonce",
 		b64encode(cipher.nonce)
 	)
 	connections_db.set(
-		"/bitbucket/{}/api_url".format(connection),
+		connection+"/api_url",
 		request.json["baseApiUrl"]
+	)
+	access_token = secret_token(16)
+	# Create an initial acces token for the Bitbucket fileviewer in the list of access tokens for quick lookup
+	connections_db.sadd(
+		connection+"/access_tokens",
+		access_token
+	)
+	# Store the token in a hash so we can retrieve it
+	connections_db.hset(
+		connection+"/access_token_names",
+		"bitbucket",
+		secret_token(16),
 	)
 	return "Installation succesfull"
 
-def get_connection(encoded_token):
-	token = jwt.decode(encoded_token, verify=False)
-	connection = token["iss"]
-	secret = connections_db.get("/bitbucket/{}/secret".format(connection))
-	if secret is None:
+def get_username(repo_path):
+	return urllib.parse.quote(repo_path.split("/")[0])
+
+def validate_jwt(username, encoded_token):
+	connection = get_connection(username)
+
+	client_key = connections_db.get(connection+"/client_key").decode("utf-8")
+	if client_key is None:
 		# TODO: create a more specific exception
 		raise Exception("Connection not found")
 
-	nonce = b64decode(connections_db.get("/bitbucket/{}/nonce".format(connection)))
+	print(client_key)
+	nonce = b64decode(connections_db.get(connection+"/nonce"))
 	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
-	secret = cipher.decrypt(secret).decode("utf-8", )
+	secret = connections_db.get(connection+"/secret")
+	secret = cipher.decrypt(secret).decode("utf-8")
+	jwt.decode(encoded_token, secret, audience=client_key)
+	# TODO: verify claims and validity of JWT
 
-	jwt.decode(request.args.get("jwt"), secret, audience=connection)
+class Unauthorized(Exception):
+    status_code = 402
 
-	return connection, secret
+    def __init__(self, message):
+        Exception.__init__(self)
+        self.message = message
+
+    def to_dict(self):
+        rv['message'] = self.message
+        return rv
+
+def validate_access_token(username, access_token):
+	connection = get_connection(username)
+	print(access_token)
+	# if not connections_db.sismember(connection+"/access_tokens", access_token):
+		# raise Unauthorized("Invalid access token")
 
 
 @app.route(base+descriptor["lifecycle"]["uninstalled"], methods=['POST'])
 def uninstalled():
-	print(request.data)
+	auth = request.headers["Authorization"].split(" ")
+	if auth[0].upper() != "JWT":
+		return "No auth"
 
 	try:
-		connection, secret = get_connection(request.args.get("jwt"))
+		connection, secret = get_connection(auth[1])
 	except jwt.InvalidSignatureError:
 		return "JWT verification failed"
 	keys = connections_db.keys("/bitbucket/{}/*".format(connection))
@@ -161,7 +210,7 @@ def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(sec
 		"sub": connection
 	}, secret, algorithm='HS256')
 
-def list_files(session, connection, base_url, secret, path, extensions=[]):
+def list_files(session, client_key, base_url, secret, repo_path, path, extensions=[]):
 	# TODO: fetch next instead of using big pagelen
 	params = {"pagelen": "50"}
 
@@ -171,12 +220,12 @@ def list_files(session, connection, base_url, secret, path, extensions=[]):
 			params["q"] += " or path~\"{}\"".format(extensions[i])
 	
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{path}".format(
-		repo_path = urllib.parse.unquote(request.args.get("repo_path")),
+		repo_path = repo_path,
 		node = request.args.get("cset"),
 		path = path
 	)
 
-	encoded_jwt = create_jwt(connection, secret, endpoint, params)
+	encoded_jwt = create_jwt(client_key, secret, endpoint, params)
 
 	print(encoded_jwt)
 
@@ -190,15 +239,14 @@ def list_files(session, connection, base_url, secret, path, extensions=[]):
 
 	return r.json()["values"]
 
-def get_and_save_file(session, connection, base_url, secret, file_path):
-	cset = request.args.get("cset")
+def get_and_save_file(session, client_key, base_url, secret, repo_path, cset, file_path):
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{file_path}".format(
-		repo_path = urllib.parse.unquote(request.args.get("repo_path")),
+		repo_path = repo_path,
 		node = cset,
 		file_path = file_path
 	)
 
-	encoded_jwt = create_jwt(connection, secret, endpoint)
+	encoded_jwt = create_jwt(client_key, secret, endpoint)
 
 	r = session.get(base_url+endpoint, headers={
 		'Authorization': "JWT "+encoded_jwt.decode('utf-8'),
@@ -218,179 +266,40 @@ def get_and_save_file(session, connection, base_url, secret, file_path):
 
 	return True
 
-def svg_page(svg):
-	yield """<!DOCTYPE html>
-		<html lang="en">
-		  <head>
-		    <script src="https://bitbucket.org/atlassian-connect/all.js"></script>
-		  </head> 
-		  <body>"""
-	chunk_size = 3*1024
-	with open(svg, 'r') as f:
-		while True:
-			data = f.read(chunk_size)
-			if not data:
-				break
-			yield data
-	yield "</body></html>"
-
 def pdf_page(pdf):
-	# TODO: use a template or something? Probably requires to send PDF seperatly
-	# PDFJS: https://mozilla.github.io/pdf.js/examples/
-	yield """<!DOCTYPE html>
-		<html lang="en">
-		  <head>
-		    <script src="https://bitbucket.org/atlassian-connect/all.js"></script>
-		    <script src="//mozilla.github.io/pdf.js/build/pdf.js"></script>
-		  </head> 
-		  <body>
-		  	<div>
-			  <button id="prev">Previous</button>
-			  <button id="next">Next</button>
-			  <span>Page: <span id="page_num"></span> / <span id="page_count"></span></span>
-			</div>
-		    <canvas id="the-canvas"></canvas>
-		  </body>
-		  <script>
-		    pdfData = atob('"""
-
-	chunk_size = 3*1024
-	with open(pdf, 'rb') as f:
-		while True:
-			data = f.read(chunk_size)
-			if not data:
-				break
-			yield b64encode(data)
-
-	yield """');
-		    // Loaded via <script> tag, create shortcut to access PDF.js exports.
-			var pdfjsLib = window['pdfjs-dist/build/pdf'];
-
-			// The workerSrc property shall be specified.
-			pdfjsLib.GlobalWorkerOptions.workerSrc = '//mozilla.github.io/pdf.js/build/pdf.worker.js';
-
-			var pdfDoc = null,
-			    pageNum = 1,
-			    pageRendering = false,
-			    pageNumPending = null,
-			    scale = 0.8,
-			    canvas = document.getElementById('the-canvas'),
-			    ctx = canvas.getContext('2d');
-
-			/**
-			 * Get page info from document, resize canvas accordingly, and render page.
-			 * @param num Page number.
-			 */
-			function renderPage(num) {
-			  pageRendering = true;
-			  // Using promise to fetch the page
-			  pdfDoc.getPage(num).then(function(page) {
-			    var viewport = page.getViewport(scale);
-			    canvas.height = viewport.height;
-			    canvas.width = viewport.width;
-
-			    // Render PDF page into canvas context
-			    var renderContext = {
-			      canvasContext: ctx,
-			      viewport: viewport
-			    };
-			    var renderTask = page.render(renderContext);
-
-			    // Wait for rendering to finish
-			    renderTask.promise.then(function() {
-			      pageRendering = false;
-			      if (pageNumPending !== null) {
-			        // New page rendering is pending
-			        renderPage(pageNumPending);
-			        pageNumPending = null;
-			      }
-			    });
-			  });
-
-			  // Update page counters
-			  document.getElementById('page_num').textContent = num;
-			}
-
-			/**
-			 * If another page rendering in progress, waits until the rendering is
-			 * finised. Otherwise, executes rendering immediately.
-			 */
-			function queueRenderPage(num) {
-			  if (pageRendering) {
-			    pageNumPending = num;
-			  } else {
-			    renderPage(num);
-			  }
-			}
-
-			/**
-			 * Displays previous page.
-			 */
-			function onPrevPage() {
-			  if (pageNum <= 1) {
-			    return;
-			  }
-			  pageNum--;
-			  queueRenderPage(pageNum);
-			}
-
-			/**
-			 * Displays next page.
-			 */
-			function onNextPage() {
-			  if (pageNum >= pdfDoc.numPages) {
-			    return;
-			  }
-			  pageNum++;
-			  queueRenderPage(pageNum);
-			}
-			document.getElementById('next').addEventListener('click', onNextPage);
-			document.getElementById('prev').addEventListener('click', onPrevPage);
-
-			/**
-			 * Asynchronously downloads PDF.
-			 */
-			pdfjsLib.getDocument({data: pdfData}).then(function(pdfDoc_) {
-			  pdfDoc = pdfDoc_;
-			  document.getElementById('page_count').textContent = pdfDoc.numPages;
-
-			  // Initial/first page rendering
-			  renderPage(pageNum);
-			});
-			</script>
-		    <meta charset="utf-8" />
-		    <meta http-equiv="X-UA-Compatible" content="IE=EDGE">
-		</html>"""
+	return
 
 @app.route(base+"/schematic-pdf", methods=['GET'])
 def schematic_pdf():
-	# TODO: Support revokeable access tokens so other services can access the files
-	try:
-		connection, secret = get_connection(request.args.get("jwt"))
-	except jwt.InvalidSignatureError:
-		return "JWT verification failed"
+	return
+	# try:
+	# 	connection, secret = get_connection(request.args.get("jwt"))
+	# except jwt.InvalidSignatureError:
+	# 	return "JWT verification failed"
 
-	# TODO: verify claims and validity of JWT
+	# # TODO: verify claims and validity of JWT
 
-	print(request.data)
+	# print(request.data)
 
-	base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
-	file_path = request.args.get("file_path")
+	# connection = get_connection(request.json["user"]["username"])
+	# base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
+	# file_path = request.args.get("file_path")
+	# client_key = 
 
-	with requests.Session() as s:
-		files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".sch", ".lib", ".pro"])
-		print(files)
-		for file in files:
-			# TODO: check if file already exists
-			get_and_save_file(s, connection, base_url, secret, file["path"])
+	# with requests.Session() as s:
+	# 	files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".sch", ".lib", ".pro"])
+	# 	print(files)
+	# 	for file in files:
+	# 		# TODO: check if file already exists
+	# 		get_and_save_file(s, client_key, base_url, secret, file["path"])
 
-	cset = request.args.get("cset")
-	# TODO: check if output file exists
-	export_schematic(
-		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
-		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
-		"PDF"
-	)
+	# cset = request.args.get("cset")
+	# # TODO: check if output file exists
+	# export_schematic(
+	# 	path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
+	# 	path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
+	# 	"PDF"
+	# )
 
 	# TODO: mmap the file so KiCad can load it quicker and we don't
 	# wait for the file to be flushed?
@@ -405,30 +314,33 @@ def schematic_pdf():
 
 	return Response(pdf_page(pdf_file))
 
-@app.route(base+"/schematic-sheet-svg", methods=['GET'])
-def schematic_sheet_svg():
-	try:
-		connection, secret = get_connection(request.args.get("jwt"))
-	except jwt.InvalidSignatureError:
-		return "JWT verification failed"
+@app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>/", methods=['GET'])
+def render_file(service, username, repo_name, file_path):
+	cset = request.args.get("cset")
+	print("Request to render %s for %s on %s".format(file_path, username, service))
+	# TODO: fail early if no access token provided
+	validate_access_token(username, request.args.get("access_token"))
 
-	# TODO: verify claims and validity of JWT
+	connection = get_connection(username)
+	client_key = connections_db.get(connection+"/client_key".format(username)).decode("utf-8")
+	base_url = connections_db.get(connection+"/api_url".format(username)).decode("utf-8")
 
-	print(request.data)
+	nonce = b64decode(connections_db.get(connection+"/nonce"))
+	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
+	secret = connections_db.get(connection+"/secret")
+	secret = cipher.decrypt(secret).decode("utf-8")
 
-	base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
-	file_path = request.args.get("file_path")
-
+	file_path, extension = os.path.splitext(file_path)
+	repo = username+"/"+repo_name
 	with requests.Session() as s:
-		get_and_save_file(s, connection, base_url, secret, file_path)
-		files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".lib", ".pro"])
-		print(files)
+		# TODO: check if file already exists
+		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
+		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".lib", ".pro"])
 		for file in files:
 			# TODO: check if file already exists
-			get_and_save_file(s, connection, base_url, secret, file["path"])
+			# get_and_save_file(session, client_key, base_url, secret, repo_path, cset, file_path):
+			get_and_save_file(s, client_key, base_url, secret, repo, cset, file["path"])
 
-	cset = request.args.get("cset")
-	full_file_path = INPUT_DIR.format(cset=cset, path=file_path)
 	# TODO: only plot one sheet
 	export_schematic(
 		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
@@ -437,9 +349,32 @@ def schematic_sheet_svg():
 	)
 
 	svg_file = OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".svg")
-	print(svg_file)
+	res = send_file(svg_file)
+	return res
 
-	return Response(svg_page(svg_file))
+@app.route(base+"/schematic-sheet-svg", methods=['GET'])
+def schematic_sheet_svg():
+	print(request.args)
+	repo_path = urllib.parse.unquote(request.args.get("repo_path"))
+	username = get_username(repo_path)
+	try:
+		validate_jwt(username, request.args.get("jwt"))
+	except jwt.InvalidSignatureError:
+		return "JWT verification failed"
+
+	cset = request.args.get("cset")
+	file_path = request.args.get("file_path")
+
+	access_token = connections_db.hget("/bitbucket.org/{}/access_token_names".format(username), "bitbucket").decode("utf-8")
+	svg_data = ADDRESS+base+"/render/{}/{}/{}.svg?cset={}&access_token={}".format(
+		"bitbucket.org",
+		repo_path,
+		file_path,
+		cset,
+		access_token
+	)
+
+	return render_template('svg.html', svg_data=svg_data)
 
 if __name__ == '__main__':
 	app.run('localhost', 5000, ssl_context='adhoc')
