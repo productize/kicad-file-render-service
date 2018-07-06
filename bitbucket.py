@@ -12,6 +12,11 @@ from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
 from kicad_automation_scripts.eeschema.export_schematic import export_schematic
 
+BASE_INPUT_DIR="/input"
+INPUT_DIR = BASE_INPUT_DIR+"/{cset}/{path}"
+BASE_OUTPUT_DIR = "./output"
+OUTPUT_DIR = BASE_OUTPUT_DIR+"/{cset}/{path}"
+
 import logging
 formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
                               datefmt='%Y-%m-%d %H:%M:%S')
@@ -29,14 +34,24 @@ if "FILE_RENDERER_KEY" not in environ:
 #  - https://bitbucket.org/tpettersen/run-bucket-run/src/master/connect-account.json?at=master
 #  - https://github.com/noamt/bitbucket-asciidoctor-addon/blob/master/atlassian-connect.json
 
-schematic_viewer = {
-	"key" : "kicad-schematic",
+schematic_viewer_pdf = {
+	"key" : "kicad-schematic-pdf",
 	"name": {
 		"i18n": "en",
-		"value": "KiCad schematic viewer"
+		"value": "Full schematic PDF"
 	},
 	"file_matches": {"extensions": ["sch"]},
-	"url": "/schematic?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
+	"url": "/schematic-pdf?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
+}
+
+schematic_sheet_viewer_svg = {
+	"key" : "kicad-schematic-sheet-svg",
+	"name": {
+		"i18n": "en",
+		"value": "Schematic sheet"
+	},
+	"file_matches": {"extensions": ["sch"]},
+	"url": "/schematic-sheet-svg?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
 }
 
 # TODO: Create file viewers for kicad_pcbs, symbols and modules
@@ -52,8 +67,8 @@ descriptor = {
 	},
 	"baseUrl": "https://blue.productize.be"+base,
 	"authentication": {
-		"type": "none"
-	}, # ToDo: Use JWT authentication and safely store secret
+		"type": "jwt"
+	},
 	"lifecycle": {
 		"installed": "/installed",
 		"uninstalled": "/uninstalled",
@@ -61,7 +76,10 @@ descriptor = {
 	"scopes": ["repository"],
 	"contexts": ["account"],
 	"modules": {
-		"fileViews": [schematic_viewer]
+		"fileViews": [
+			schematic_viewer_pdf,
+			schematic_sheet_viewer_svg
+		]
 	}
 }
 
@@ -77,15 +95,15 @@ def installed():
 
 	connection = request.json["clientKey"]
 	connections_db.set(
-		"/bitbucket/%s/secret".format(connection),
+		"/bitbucket/{}/secret".format(connection),
 		cipher.encrypt(request.json["sharedSecret"].encode("utf-8"))
 	)
 	connections_db.set(
-		"/bitbucket/%s/nonce".format(connection),
+		"/bitbucket/{}/nonce".format(connection),
 		b64encode(cipher.nonce)
 	)
 	connections_db.set(
-		"/bitbucket/%s/api_url".format(connection),
+		"/bitbucket/{}/api_url".format(connection),
 		request.json["baseApiUrl"]
 	)
 	return "Installation succesfull"
@@ -93,11 +111,12 @@ def installed():
 def get_connection(encoded_token):
 	token = jwt.decode(encoded_token, verify=False)
 	connection = token["iss"]
-	secret = connections_db.get("/bitbucket/%s/secret".format(connection))
+	secret = connections_db.get("/bitbucket/{}/secret".format(connection))
 	if secret is None:
-		return "Connection not found"
+		# TODO: create a more specific exception
+		raise Exception("Connection not found")
 
-	nonce = b64decode(connections_db.get("/bitbucket/%s/nonce".format(connection)))
+	nonce = b64decode(connections_db.get("/bitbucket/{}/nonce".format(connection)))
 	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
 	secret = cipher.decrypt(secret).decode("utf-8", )
 
@@ -111,10 +130,10 @@ def uninstalled():
 	print(request.data)
 
 	try:
-		token, secret = get_connection(request.args.get("jwt"))
+		connection, secret = get_connection(request.args.get("jwt"))
 	except jwt.InvalidSignatureError:
 		return "JWT verification failed"
-	keys = connections_db.keys("/bitbucket/%s/*".format(connection))
+	keys = connections_db.keys("/bitbucket/{}/*".format(connection))
 	connections_db.delete(keys)
 
 	return "Uninstallation succesfull"
@@ -123,7 +142,7 @@ def uninstalled():
 def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(seconds=120)):
 	# See https://developer.atlassian.com/cloud/bitbucket/query-string-hash/
 	canonical_request = "GET&"+endpoint+"&"
-	# Addind params does not seem required, but is in spec...
+	# Adding params does not seem required, but is in spec...
 	i = 0
 	for p_key, p_value in params.items():
 		canonical_request += "{}={}".format(p_key, urllib.parse.quote(p_value))
@@ -142,12 +161,15 @@ def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(sec
 		"sub": connection
 	}, secret, algorithm='HS256')
 
-def list_files(session, connection, base_url, secret, path):
-	params = {
-		"q": "path~\".sch\" or path~\".lib\"",
-		"pagelen": "50"
-	}
+def list_files(session, connection, base_url, secret, path, extensions=[]):
 	# TODO: fetch next instead of using big pagelen
+	params = {"pagelen": "50"}
+
+	if len(extensions) > 0:
+		params["q"] = "path~\"{}\"".format(extensions[0])
+		for i in range(1, len(extensions)-1):
+			params["q"] += " or path~\"{}\"".format(extensions[i])
+	
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{path}".format(
 		repo_path = urllib.parse.unquote(request.args.get("repo_path")),
 		node = request.args.get("cset"),
@@ -169,9 +191,10 @@ def list_files(session, connection, base_url, secret, path):
 	return r.json()["values"]
 
 def get_and_save_file(session, connection, base_url, secret, file_path):
+	cset = request.args.get("cset")
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{file_path}".format(
 		repo_path = urllib.parse.unquote(request.args.get("repo_path")),
-		node = request.args.get("cset"),
+		node = cset,
 		file_path = file_path
 	)
 
@@ -185,7 +208,7 @@ def get_and_save_file(session, connection, base_url, secret, file_path):
 		print("Failed get file")
 		return False
 
-	full_file_path = "./tmp/{}".format(file_path)
+	full_file_path = INPUT_DIR.format(cset=cset, path=file_path)
 	directory = path.dirname(full_file_path)
 	if not path.exists(directory):
 		makedirs(directory)
@@ -195,7 +218,23 @@ def get_and_save_file(session, connection, base_url, secret, file_path):
 
 	return True
 
-def generate_pdf(pdf):
+def svg_page(svg):
+	yield """<!DOCTYPE html>
+		<html lang="en">
+		  <head>
+		    <script src="https://bitbucket.org/atlassian-connect/all.js"></script>
+		  </head> 
+		  <body>"""
+	chunk_size = 3*1024
+	with open(svg, 'r') as f:
+		while True:
+			data = f.read(chunk_size)
+			if not data:
+				break
+			yield data
+	yield "</body></html>"
+
+def pdf_page(pdf):
 	# TODO: use a template or something? Probably requires to send PDF seperatly
 	# PDFJS: https://mozilla.github.io/pdf.js/examples/
 	yield """<!DOCTYPE html>
@@ -321,11 +360,10 @@ def generate_pdf(pdf):
 			</script>
 		    <meta charset="utf-8" />
 		    <meta http-equiv="X-UA-Compatible" content="IE=EDGE">
-		    <title>Hello, world</title>
 		</html>"""
 
-@app.route(base+"/schematic", methods=['GET'])
-def schematic():
+@app.route(base+"/schematic-pdf", methods=['GET'])
+def schematic_pdf():
 	# TODO: Support revokeable access tokens so other services can access the files
 	try:
 		connection, secret = get_connection(request.args.get("jwt"))
@@ -336,20 +374,23 @@ def schematic():
 
 	print(request.data)
 
-	base_url = connections_db.get("/bitbucket/%s/api_url".format(connection)).decode("utf-8")
-
+	base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
 	file_path = request.args.get("file_path")
 
 	with requests.Session() as s:
-		files = list_files(s, connection, base_url, secret, path.dirname(file_path))
+		files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".sch", ".lib", ".pro"])
 		print(files)
 		for file in files:
 			# TODO: check if file already exists
 			get_and_save_file(s, connection, base_url, secret, file["path"])
 
+	cset = request.args.get("cset")
 	# TODO: check if output file exists
-	full_file_path = "./tmp/{}".format(file_path)
-	export_schematic(path.abspath(full_file_path), path.abspath("./build"))
+	export_schematic(
+		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
+		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
+		"PDF"
+	)
 
 	# TODO: mmap the file so KiCad can load it quicker and we don't
 	# wait for the file to be flushed?
@@ -359,10 +400,46 @@ def schematic():
 	# TODO: Store PDF in cache and link to cached PDF
 	# This is prabably also required to use the browser's cache...
 
-	pdf_file = "./build/"+path.basename(file_path).split(".")[0]+".pdf"
+	pdf_file = path.abspath(OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".pdf"))
 	print(pdf_file)
 
-	return Response(generate_pdf(pdf_file))
+	return Response(pdf_page(pdf_file))
+
+@app.route(base+"/schematic-sheet-svg", methods=['GET'])
+def schematic_sheet_svg():
+	try:
+		connection, secret = get_connection(request.args.get("jwt"))
+	except jwt.InvalidSignatureError:
+		return "JWT verification failed"
+
+	# TODO: verify claims and validity of JWT
+
+	print(request.data)
+
+	base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
+	file_path = request.args.get("file_path")
+
+	with requests.Session() as s:
+		get_and_save_file(s, connection, base_url, secret, file_path)
+		files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".lib", ".pro"])
+		print(files)
+		for file in files:
+			# TODO: check if file already exists
+			get_and_save_file(s, connection, base_url, secret, file["path"])
+
+	cset = request.args.get("cset")
+	full_file_path = INPUT_DIR.format(cset=cset, path=file_path)
+	# TODO: only plot one sheet
+	export_schematic(
+		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
+		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
+		"SVG"
+	)
+
+	svg_file = OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".svg")
+	print(svg_file)
+
+	return Response(svg_page(svg_file))
 
 if __name__ == '__main__':
 	app.run('localhost', 5000, ssl_context='adhoc')
