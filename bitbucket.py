@@ -1,6 +1,6 @@
 
 import json
-from flask import Flask, request, Response, render_template, send_file
+from flask import Flask, request, Response, render_template, send_file, abort
 import jwt
 from datetime import timezone, datetime, timedelta
 import urllib.parse
@@ -131,7 +131,7 @@ def installed():
 	connections_db.hset(
 		connection+"/access_token_names",
 		"bitbucket",
-		secret_token(16),
+		access_token
 	)
 	return "Installation succesfull"
 
@@ -154,22 +154,11 @@ def validate_jwt(username, encoded_token):
 	jwt.decode(encoded_token, secret, audience=client_key)
 	# TODO: verify claims and validity of JWT
 
-class Unauthorized(Exception):
-    status_code = 402
-
-    def __init__(self, message):
-        Exception.__init__(self)
-        self.message = message
-
-    def to_dict(self):
-        rv['message'] = self.message
-        return rv
-
 def validate_access_token(username, access_token):
 	connection = get_connection(username)
 	print(access_token)
-	# if not connections_db.sismember(connection+"/access_tokens", access_token):
-		# raise Unauthorized("Invalid access token")
+	if not connections_db.sismember(connection+"/access_tokens", access_token):
+		abort(401, "Invalid access token")
 
 
 @app.route(base+descriptor["lifecycle"]["uninstalled"], methods=['POST'])
