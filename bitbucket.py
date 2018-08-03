@@ -28,7 +28,11 @@ formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
                               datefmt='%Y-%m-%d %H:%M:%S')
 
 app = Flask(__name__)
-base = "/bitbucket-fileviewer"
+if "BASE_PATH" in environ:
+	base = environ["BASE_PATH"]
+else:
+	base = ""
+
 connections_db = StrictRedis(host="connections-db")
 
 if "KICAD_FILE_RENDERER_KEY" in environ:
@@ -312,6 +316,7 @@ def render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path):
 def render_svg_layout(client_key, base_url, secret, repo, cset, file_path):
 	with requests.Session() as s:
 		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
+
 
 	with pcb_util.get_plotter(pcb_file, temp_dir) as plotter:
 		output_filename = plotter.plot(layer['layer'], pcbnew.PLOT_FORMAT_SVG)
