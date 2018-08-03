@@ -1,15 +1,15 @@
-
 import json
 from flask import Flask, request, Response, render_template, send_file, abort
 import jwt
 from datetime import timezone, datetime, timedelta
-import urllib.parse
+from urllib.parse import quote, unquote
 from os import environ, path, makedirs
 from hashlib import sha256
 import requests
 from redis import StrictRedis
 from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
+# TODO: clean this up
 from kicad_automation_scripts.eeschema.export_schematic import export_schematic
 try:
 	from secrets import token_hex as secret_token
@@ -18,7 +18,6 @@ except ImportError:
 	def secret_token(nbytes=None):
 		return urandom(nbytes).hex()
 
-ADDRESS="https://blue.productize.be"
 BASE_INPUT_DIR="./input"
 INPUT_DIR = BASE_INPUT_DIR+"/{cset}/{path}"
 BASE_OUTPUT_DIR = "./output"
@@ -32,14 +31,35 @@ app = Flask(__name__)
 base = "/bitbucket-fileviewer"
 connections_db = StrictRedis(host="connections-db")
 
-if "FILE_RENDERER_KEY" not in environ:
-	print("No FILE_RENDERER_KEY set")
+if "KICAD_FILE_RENDERER_KEY" in environ:
+	connections_db_key = environ["KICAD_FILE_RENDERER_KEY"]
+elif path.exists('/connections_db_key'):
+	with open('/connections_db_key', "r") as f:
+		connections_db_key = f.readline()
+else:
+	print("No KICAD_FILE_RENDERER_KEY set and no connections_db_key file found")
 	exit(1);
+
+if "ADDRESS" not in environ:
+	print("No ADDRESS set")
+	exit(1);
+
+ADDRESS=environ["ADDRESS"]
 
 # File viewer modules. See https://developer.atlassian.com/cloud/bitbucket/modules/file-viewer/
 # Examples:
 #  - https://bitbucket.org/tpettersen/run-bucket-run/src/master/connect-account.json?at=master
 #  - https://github.com/noamt/bitbucket-asciidoctor-addon/blob/master/atlassian-connect.json
+
+schematic_sheet_viewer_svg = {
+	"key" : "kicad-schematic-sheet-svg",
+	"name": {
+		"i18n": "en",
+		"value": "Schematic sheet"
+	},
+	"file_matches": {"extensions": ["sch"]},
+	"url": "/schematic-sheet-svg?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
+}
 
 schematic_viewer_pdf = {
 	"key" : "kicad-schematic-pdf",
@@ -51,14 +71,14 @@ schematic_viewer_pdf = {
 	"url": "/schematic-pdf?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
 }
 
-schematic_sheet_viewer_svg = {
-	"key" : "kicad-schematic-sheet-svg",
+layout_viewer_svg = {
+	"key" : "kicad-layout-svg",
 	"name": {
 		"i18n": "en",
-		"value": "Schematic sheet"
+		"value": "Layout"
 	},
-	"file_matches": {"extensions": ["sch"]},
-	"url": "/schematic-sheet-svg?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
+	"file_matches": {"extensions": ["kicad_pcb"]},
+	"url": "/layout-svg?repo_path={repo_path}&cset={file_cset}&file_path={file_path}"
 }
 
 # TODO: Create file viewers for kicad_pcbs, symbols and modules
@@ -84,8 +104,8 @@ descriptor = {
 	"contexts": ["account"],
 	"modules": {
 		"fileViews": [
-			schematic_viewer_pdf,
-			schematic_sheet_viewer_svg
+			schematic_sheet_viewer_svg,
+			schematic_viewer_pdf
 		]
 	}
 }
@@ -101,7 +121,7 @@ def get_connection(username):
 def installed():
 	print(request.data)
 
-	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM)
+	cipher = AES.new(b64decode(connections_db_key), AES.MODE_GCM)
 
 	connection = get_connection(request.json["user"]["username"])
 	connections_db.set(
@@ -135,7 +155,7 @@ def installed():
 	return "Installation succesfull"
 
 def get_username(repo_path):
-	return urllib.parse.quote(repo_path.split("/")[0])
+	return quote(repo_path.split("/")[0])
 
 def validate_jwt(username, encoded_token):
 	connection = get_connection(username)
@@ -147,7 +167,7 @@ def validate_jwt(username, encoded_token):
 
 	print(client_key)
 	nonce = b64decode(connections_db.get(connection+"/nonce"))
-	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
+	cipher = AES.new(b64decode(connections_db_key), AES.MODE_GCM, nonce=nonce)
 	secret = connections_db.get(connection+"/secret")
 	secret = cipher.decrypt(secret).decode("utf-8")
 	jwt.decode(encoded_token, secret, audience=client_key)
@@ -182,7 +202,7 @@ def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(sec
 	# Adding params does not seem required, but is in spec...
 	i = 0
 	for p_key, p_value in params.items():
-		canonical_request += "{}={}".format(p_key, urllib.parse.quote(p_value))
+		canonical_request += "{}={}".format(p_key, quote(p_value))
 		i += 1
 		if i < len(params)-1:
 			canonical_request += "&"
@@ -215,8 +235,6 @@ def list_files(session, client_key, base_url, secret, repo_path, path, extension
 	)
 
 	encoded_jwt = create_jwt(client_key, secret, endpoint, params)
-
-	print(encoded_jwt)
 
 	r = session.get(base_url+endpoint, params=params, headers={
 		'Authorization': "JWT "+encoded_jwt.decode('utf-8'),
@@ -255,54 +273,6 @@ def get_and_save_file(session, client_key, base_url, secret, repo_path, cset, fi
 
 	return True
 
-def pdf_page(pdf):
-	return
-
-@app.route(base+"/schematic-pdf", methods=['GET'])
-def schematic_pdf():
-	return
-	# try:
-	# 	connection, secret = get_connection(request.args.get("jwt"))
-	# except jwt.InvalidSignatureError:
-	# 	return "JWT verification failed"
-
-	# # TODO: verify claims and validity of JWT
-
-	# print(request.data)
-
-	# connection = get_connection(request.json["user"]["username"])
-	# base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
-	# file_path = request.args.get("file_path")
-	# client_key =
-
-	# with requests.Session() as s:
-	# 	files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".sch", ".lib", ".pro"])
-	# 	print(files)
-	# 	for file in files:
-	# 		# TODO: check if file already exists
-	# 		get_and_save_file(s, client_key, base_url, secret, file["path"])
-
-	# cset = request.args.get("cset")
-	# # TODO: check if output file exists
-	# export_schematic(
-	# 	path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
-	# 	path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
-	# 	"PDF"
-	# )
-
-	# TODO: mmap the file so KiCad can load it quicker and we don't
-	# wait for the file to be flushed?
-	# Also, maybe it's possible to already start opening the files before they
-	# are fully downloaded (making sure they are all created)?
-
-	# TODO: Store PDF in cache and link to cached PDF
-	# This is prabably also required to use the browser's cache...
-
-	pdf_file = path.abspath(OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".pdf"))
-	print(pdf_file)
-
-	return Response(pdf_page(pdf_file))
-
 def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
 	with requests.Session() as s:
 		# TODO: check if file already exists
@@ -310,10 +280,8 @@ def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
 		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".lib", ".pro"])
 		for file in files:
 			# TODO: check if file already exists
-			# get_and_save_file(session, client_key, base_url, secret, repo_path, cset, file_path):
 			get_and_save_file(s, client_key, base_url, secret, repo, cset, file["path"])
 
-	# TODO: only plot one sheet
 	export_schematic(
 		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
 		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
@@ -324,7 +292,33 @@ def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
 	res = send_file(svg_file)
 	return res
 
-# render_svg_layout(client_key, base_url, secret, repo, cset, file_path):
+def render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path):
+	with requests.Session() as s:
+		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".sch", ".lib", ".pro"])
+		for file in files:
+			# TODO: check if file already exists
+			get_and_save_file(s, client_key, base_url, secret, repo, cset, file["path"])
+
+	export_schematic(
+		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
+		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
+		"PDF"
+	)
+
+	pdf_file = path.abspath(OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".pdf"))
+	res = send_file(pdf_file)
+	return res
+
+def render_svg_layout(client_key, base_url, secret, repo, cset, file_path):
+	with requests.Session() as s:
+		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
+
+	with pcb_util.get_plotter(pcb_file, temp_dir) as plotter:
+		output_filename = plotter.plot(layer['layer'], pcbnew.PLOT_FORMAT_SVG)
+	return send_file(output_filename)
+
+def render_pdf_layout(client_key, base_url, secret, repo, cset, file_path):
+	return "WIP"
 
 
 @app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>/", methods=['GET'])
@@ -339,7 +333,7 @@ def render_file(service, username, repo_name, file_path):
 	base_url = connections_db.get(connection+"/api_url".format(username)).decode("utf-8")
 
 	nonce = b64decode(connections_db.get(connection+"/nonce"))
-	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
+	cipher = AES.new(b64decode(connections_db_key), AES.MODE_GCM, nonce=nonce)
 	secret = connections_db.get(connection+"/secret")
 	secret = cipher.decrypt(secret).decode("utf-8")
 
@@ -367,29 +361,46 @@ def render_file(service, username, repo_name, file_path):
 			return render_pdf_layout(client_key, base_url, secret, repo, cset, file_path)
 
 
-@app.route(base+"/schematic-sheet-svg", methods=['GET'])
-def schematic_sheet_svg():
-	print(request.args)
-	repo_path = urllib.parse.unquote(request.args.get("repo_path"))
+def validate_and_get_request_data():
+	repo_path = unquote(request.args.get("repo_path"))
 	username = get_username(repo_path)
 	try:
 		validate_jwt(username, request.args.get("jwt"))
 	except jwt.InvalidSignatureError:
-		return "JWT verification failed"
+		abort(401, "Invalid access token")
 
-	cset = request.args.get("cset")
 	file_path = request.args.get("file_path")
+	cset = request.args.get("cset")
 
 	access_token = connections_db.hget("/bitbucket.org/{}/access_token_names".format(username), "bitbucket").decode("utf-8")
-	svg_data = ADDRESS+base+"/render/{}/{}/{}.svg?cset={}&access_token={}".format(
+
+	return username, repo_path, file_path, cset, access_token
+
+@app.route(base+"/schematic-sheet-svg", methods=['GET'])
+def schematic_sheet_svg():
+	username, repo_path, file_path, cset, access_token = validate_and_get_request_data()
+
+	svg_url = ADDRESS+base+"/render/{}/{}/{}.svg?cset={}&access_token={}".format(
 		"bitbucket.org",
 		repo_path,
 		file_path,
 		cset,
 		access_token
 	)
+	return render_template('svg.html', svg_url=unquote(svg_url))
 
-	return render_template('svg.html', svg_data=svg_data)
+@app.route(base+"/schematic-pdf", methods=['GET'])
+def schematic_pdf():
+	username, repo_path, file_path, cset, access_token = validate_and_get_request_data()
+
+	pdf_url = ADDRESS+base+"/render/{}/{}/{}.pdf?cset={}&access_token={}".format(
+		"bitbucket.org",
+		repo_path,
+		file_path,
+		cset,
+		access_token
+	)
+	return render_template('pdf.html', pdf_url=pdf_url)
 
 if __name__ == '__main__':
-	app.run('localhost', 5000, ssl_context='adhoc')
+	app.run('0.0.0.0', 5000)

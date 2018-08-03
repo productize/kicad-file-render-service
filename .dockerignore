@@ -1,0 +1,24 @@
+# Not needed for running
+README.md
+Dockerfile
+docker-compose.yml
+
+# Availible in base image
+# Remove the submodule?
+kicad_automation_scripts
+
+# Python stuff
+env/
+*.pyc
+__pycache__/
+
+# Output
+input/
+output/
+
+# Git stuff
+.git
+.gitignore
+
+# MacOS stuff
+.DS_Store
