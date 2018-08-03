@@ -5,7 +5,6 @@ import jwt
 from datetime import timezone, datetime, timedelta
 import urllib.parse
 from os import environ, path, makedirs
-import os
 from hashlib import sha256
 import requests
 from redis import StrictRedis
@@ -20,7 +19,7 @@ except ImportError:
 		return urandom(nbytes).hex()
 
 ADDRESS="https://blue.productize.be"
-BASE_INPUT_DIR="/input"
+BASE_INPUT_DIR="./input"
 INPUT_DIR = BASE_INPUT_DIR+"/{cset}/{path}"
 BASE_OUTPUT_DIR = "./output"
 OUTPUT_DIR = BASE_OUTPUT_DIR+"/{cset}/{path}"
@@ -205,9 +204,10 @@ def list_files(session, client_key, base_url, secret, repo_path, path, extension
 
 	if len(extensions) > 0:
 		params["q"] = "path~\"{}\"".format(extensions[0])
-		for i in range(1, len(extensions)-1):
+		for i in range(1, len(extensions)):
+			print(extensions[i])
 			params["q"] += " or path~\"{}\"".format(extensions[i])
-	
+
 	endpoint = "/2.0/repositories/{repo_path}/src/{node}/{path}".format(
 		repo_path = repo_path,
 		node = request.args.get("cset"),
@@ -273,7 +273,7 @@ def schematic_pdf():
 	# connection = get_connection(request.json["user"]["username"])
 	# base_url = connections_db.get("/bitbucket/{}/api_url".format(connection)).decode("utf-8")
 	# file_path = request.args.get("file_path")
-	# client_key = 
+	# client_key =
 
 	# with requests.Session() as s:
 	# 	files = list_files(s, connection, base_url, secret, path.dirname(file_path), [".sch", ".lib", ".pro"])
@@ -303,24 +303,7 @@ def schematic_pdf():
 
 	return Response(pdf_page(pdf_file))
 
-@app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>/", methods=['GET'])
-def render_file(service, username, repo_name, file_path):
-	cset = request.args.get("cset")
-	print("Request to render %s for %s on %s".format(file_path, username, service))
-	# TODO: fail early if no access token provided
-	validate_access_token(username, request.args.get("access_token"))
-
-	connection = get_connection(username)
-	client_key = connections_db.get(connection+"/client_key".format(username)).decode("utf-8")
-	base_url = connections_db.get(connection+"/api_url".format(username)).decode("utf-8")
-
-	nonce = b64decode(connections_db.get(connection+"/nonce"))
-	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
-	secret = connections_db.get(connection+"/secret")
-	secret = cipher.decrypt(secret).decode("utf-8")
-
-	file_path, extension = os.path.splitext(file_path)
-	repo = username+"/"+repo_name
+def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
 	with requests.Session() as s:
 		# TODO: check if file already exists
 		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
@@ -340,6 +323,49 @@ def render_file(service, username, repo_name, file_path):
 	svg_file = OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".svg")
 	res = send_file(svg_file)
 	return res
+
+# render_svg_layout(client_key, base_url, secret, repo, cset, file_path):
+
+
+@app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>/", methods=['GET'])
+def render_file(service, username, repo_name, file_path):
+	cset = request.args.get("cset")
+	print("Request to render {} for {} on {}".format(file_path, username, service))
+	# TODO: fail early if no access token provided
+	validate_access_token(username, request.args.get("access_token"))
+
+	connection = get_connection(username)
+	client_key = connections_db.get(connection+"/client_key".format(username)).decode("utf-8")
+	base_url = connections_db.get(connection+"/api_url".format(username)).decode("utf-8")
+
+	nonce = b64decode(connections_db.get(connection+"/nonce"))
+	cipher = AES.new(b64decode(environ["FILE_RENDERER_KEY"]), AES.MODE_GCM, nonce=nonce)
+	secret = connections_db.get(connection+"/secret")
+	secret = cipher.decrypt(secret).decode("utf-8")
+
+	file_path, out_extension = path.splitext(file_path)
+
+	_, in_extension = path.splitext(file_path)
+
+	out_extension = out_extension.lower()
+	in_extension = in_extension.lower()
+
+	print("In extension: {}, out: {}".format(in_extension, out_extension))
+
+	repo = username+"/"+repo_name
+
+	if (out_extension == ".svg"):
+		if (in_extension == ".sch"):
+			print ("Rendering SVG schematic")
+			return render_svg_schematic(client_key, base_url, secret, repo, cset, file_path)
+		elif (in_extension == "kicad_pcb"):
+			return render_svg_layout(client_key, base_url, secret, repo, cset, file_path)
+	elif (out_extension == ".pdf"):
+		if (in_extension == ".sch"):
+			return render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path)
+		elif (in_extension == "kicad_pcb"):
+			return render_pdf_layout(client_key, base_url, secret, repo, cset, file_path)
+
 
 @app.route(base+"/schematic-sheet-svg", methods=['GET'])
 def schematic_sheet_svg():
