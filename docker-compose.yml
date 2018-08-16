@@ -1,0 +1,13 @@
+version: '3'
+services:
+  web:
+    build: .
+    ports:
+     - "5000:5000"
+  db:
+    image: "redis:alpine"
+
+networks:
+  kicad-file-render-network
+secrets:
+  - file_render_key

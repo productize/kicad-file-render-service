@@ -23,4 +23,4 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 ENV FLASK_APP=bitbucket.py
 EXPOSE 5000
-CMD ["python3", "-mflask", "run"]
+CMD ["python", "bitbucket.py"]

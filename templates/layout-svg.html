@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+
+{% block head %}
+<link rel="stylesheet" href="https://aui-cdn.atlassian.com/aui-adg/6.0.9/css/aui.css" media="all">
+<link rel="stylesheet" type="text/css" href="static/layout-svg.css">
+<script src="https://code.jquery.com/jquery-3.3.1.slim.min.js" integrity="sha256-3edrmyuQ0w65f8gfBsqowzjJe2iM6n0nKciPUp8y+7E=" crossorigin="anonymous"></script>
+{% endblock %}
+
+{% block content %}
+{% autoescape false %}
+  <div id="wrapper">
+    <div id="right-wrapper">
+      <div id="layer-selector">
+        <form action="#">
+          {% for layer in layers %}
+          {% set css_name = layer.replace(".", "_")  %}
+          <div class=layer-options>
+            <input name="top-layer" type="radio" value="{{css_name}}" checked>
+            <input name="{{css_name}}-color" type="color" value="#e66465" class="layer-color" />
+            <input name="{{css_name}}-visible" type="checkbox" class="layer-visible" checked>
+            <label for="{{css_name}}-visible">{{layer}}</label>
+          </div>
+          {% endfor %}
+        </form>
+     </div>
+    </div>
+    <div id="layout">
+      {% for layer in layers %}
+      {% set css_name = layer.replace(".", "_")  %}
+      <img id="{{css_name}}" class="layer" src="{{svg_url}}&layer={{layer}}"></img>
+      {% endfor %}
+    </div>
+  </div>
+{% endautoescape %}
+{% endblock %}
+
+{% block bottom %}
+<script src="static/layout-svg.js"></script>
+{% endblock %}

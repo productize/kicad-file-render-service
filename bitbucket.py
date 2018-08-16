@@ -1,9 +1,10 @@
 import json
 from flask import Flask, request, Response, render_template, send_file, abort
 import jwt
-from datetime import timezone, datetime, timedelta
-from urllib.parse import quote, unquote
+from time import time
+from urllib import quote, unquote
 from os import environ, path, makedirs
+from shutil import copyfile
 from hashlib import sha256
 import requests
 from redis import StrictRedis
@@ -11,6 +12,8 @@ from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
 # TODO: clean this up
 from kicad_automation_scripts.eeschema.export_schematic import export_schematic
+from kicad_automation_scripts._pcbnew import pcb_util
+from pcbnew import PLOT_FORMAT_SVG
 try:
 	from secrets import token_hex as secret_token
 except ImportError:
@@ -109,7 +112,8 @@ descriptor = {
 	"modules": {
 		"fileViews": [
 			schematic_sheet_viewer_svg,
-			schematic_viewer_pdf
+			schematic_viewer_pdf,
+			layout_viewer_svg
 		]
 	}
 }
@@ -200,7 +204,7 @@ def uninstalled():
 	return "Uninstallation succesfull"
 
 
-def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(seconds=120)):
+def create_jwt(connection, secret, endpoint, params = {}, validity=120):
 	# See https://developer.atlassian.com/cloud/bitbucket/query-string-hash/
 	canonical_request = "GET&"+endpoint+"&"
 	# Adding params does not seem required, but is in spec...
@@ -213,11 +217,11 @@ def create_jwt(connection, secret, endpoint, params = {}, validity=timedelta(sec
 	qsh = sha256(canonical_request.encode('utf-8')).hexdigest()
 
 	# Create JWT. See https://developer.atlassian.com/cloud/bitbucket/understanding-jwt-for-apps/#claims
-	now = datetime.now(tz=timezone.utc)
+	now = int(time())
 	return jwt.encode({
 		"iss": descriptor["key"],
-		"iat": int(now.timestamp()),
-		"exp": int((now + validity).timestamp()),
+		"iat": now,
+		"exp": now + validity,
 		"qsh": qsh,
 		"sub": connection
 	}, secret, algorithm='HS256')
@@ -272,19 +276,28 @@ def get_and_save_file(session, client_key, base_url, secret, repo_path, cset, fi
 	if not path.exists(directory):
 		makedirs(directory)
 
-	with open(full_file_path, "w+") as f:
-		f.write(r.content.decode("utf-8"))
+	with open(full_file_path, "w") as f:
+		f.write(r.content)
 
 	return True
 
-def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
+
+def get_schematic_files(client_key, base_url, secret, repo, cset, file_path):
 	with requests.Session() as s:
-		# TODO: check if file already exists
-		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
-		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".lib", ".pro"])
+		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".sch", ".lib", ".pro"])
 		for file in files:
 			# TODO: check if file already exists
 			get_and_save_file(s, client_key, base_url, secret, repo, cset, file["path"])
+			# Create copy of project files so cached symbols are found and libs are in correct order
+			for ext in [".pro", "-cache.lib"]:
+				if file["path"].endswith(ext) and file["path"].rpartition(ext)[0] != file_path.rpartition(".sch")[0]:
+					copyfile(
+						INPUT_DIR.format(cset=cset, path=file["path"]),
+						INPUT_DIR.format(cset=cset, path=file_path.rpartition(".sch")[0]+ext)
+					)
+
+def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
+	get_schematic_files(client_key, base_url, secret, repo, cset, file_path)
 
 	export_schematic(
 		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
@@ -292,43 +305,44 @@ def render_svg_schematic(client_key, base_url, secret, repo, cset, file_path):
 		"SVG"
 	)
 
-	svg_file = OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".svg")
-	res = send_file(svg_file)
-	return res
+	svg_file = path.abspath(OUTPUT_DIR.format(cset=cset, path=file_path+'.svg'))
+	return send_file(svg_file)
 
 def render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path):
-	with requests.Session() as s:
-		files = list_files(s, client_key, base_url, secret, repo, path.dirname(file_path), [".sch", ".lib", ".pro"])
-		for file in files:
-			# TODO: check if file already exists
-			get_and_save_file(s, client_key, base_url, secret, repo, cset, file["path"])
+	get_schematic_files(client_key, base_url, secret, repo, cset, file_path)
 
 	export_schematic(
 		path.abspath(INPUT_DIR.format(cset=cset, path=file_path)),
 		path.abspath(OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))),
-		"PDF"
+		"PDF",
+		True
 	)
 
 	pdf_file = path.abspath(OUTPUT_DIR.format(cset=cset, path=file_path.split(".")[0]+".pdf"))
-	res = send_file(pdf_file)
-	return res
+	return send_file(pdf_file)
 
-def render_svg_layout(client_key, base_url, secret, repo, cset, file_path):
+def render_svg_layout(client_key, base_url, secret, repo, cset, file_path, layer):
+	print(file_path);
 	with requests.Session() as s:
 		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
 
+	input_file = INPUT_DIR.format(cset=cset, path=file_path)
+	output_dir = OUTPUT_DIR.format(cset=cset, path=path.dirname(file_path))
 
-	with pcb_util.get_plotter(pcb_file, temp_dir) as plotter:
-		output_filename = plotter.plot(layer['layer'], pcbnew.PLOT_FORMAT_SVG)
+	directory = path.dirname(output_dir)
+	if not path.exists(directory):
+		makedirs(directory)
+
+	with pcb_util.get_plotter(input_file, path.abspath(output_dir)) as plotter:
+		output_filename = plotter.plot(pcb_util.layer_from_name(layer), PLOT_FORMAT_SVG)
+
+	print output_filename
 	return send_file(output_filename)
 
-def render_pdf_layout(client_key, base_url, secret, repo, cset, file_path):
-	return "WIP"
-
-
-@app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>/", methods=['GET'])
+@app.route(base+"/render/<service>/<username>/<repo_name>/<path:file_path>", methods=['GET'])
 def render_file(service, username, repo_name, file_path):
 	cset = request.args.get("cset")
+	# TODO: figure out commit hash if cset is not commit and redirect to commit hash
 	print("Request to render {} for {} on {}".format(file_path, username, service))
 	# TODO: fail early if no access token provided
 	validate_access_token(username, request.args.get("access_token"))
@@ -357,12 +371,12 @@ def render_file(service, username, repo_name, file_path):
 		if (in_extension == ".sch"):
 			print ("Rendering SVG schematic")
 			return render_svg_schematic(client_key, base_url, secret, repo, cset, file_path)
-		elif (in_extension == "kicad_pcb"):
-			return render_svg_layout(client_key, base_url, secret, repo, cset, file_path)
+		elif (in_extension == ".kicad_pcb"):
+			return render_svg_layout(client_key, base_url, secret, repo, cset, file_path, request.args.get("layer"))
 	elif (out_extension == ".pdf"):
 		if (in_extension == ".sch"):
 			return render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path)
-		elif (in_extension == "kicad_pcb"):
+		elif (in_extension == ".kicad_pcb"):
 			return render_pdf_layout(client_key, base_url, secret, repo, cset, file_path)
 
 
@@ -392,7 +406,7 @@ def schematic_sheet_svg():
 		cset,
 		access_token
 	)
-	return render_template('svg.html', svg_url=unquote(svg_url))
+	return render_template('schematic-svg.html', svg_url=unquote(svg_url))
 
 @app.route(base+"/schematic-pdf", methods=['GET'])
 def schematic_pdf():
@@ -407,5 +421,30 @@ def schematic_pdf():
 	)
 	return render_template('pdf.html', pdf_url=pdf_url)
 
+@app.route(base+"/layout-svg", methods=['GET'])
+def layout_svg():
+	username, repo_path, file_path, cset, access_token = validate_and_get_request_data()
+
+	svg_url = ADDRESS+base+"/render/{}/{}/{}.svg?cset={}&access_token={}".format(
+		"bitbucket.org",
+		repo_path,
+		file_path,
+		cset,
+		access_token
+	)
+	# TODO: figure out layers from file
+	layers = [
+		"F.Cu",
+		"B.Cu"
+	]
+	return render_template('layout-svg.html', svg_url=unquote(svg_url), layers=layers)
+
+@app.route('/static/<path:path>')
+def send_js(path):
+    return send_from_directory('static', path)
+
 if __name__ == '__main__':
-	app.run('0.0.0.0', 5000)
+	if "INTERFACE" not in environ:
+		app.run(5000)
+	else :
+		app.run(environ["INTERFACE"], 5000)
