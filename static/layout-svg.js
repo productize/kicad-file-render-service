@@ -41,12 +41,10 @@ function hexColortoHSV(hex) {
     h = 0; // achromatic
   } else {
     switch (max) {
-      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
-      case g: h = (b - r) / d + 2; break;
-      case b: h = (r - g) / d + 4; break;
+      case r: h = 60 * (((g - b) / d) % 6); break;
+      case g: h = 60 * ((b - r) / d + 2); break;
+      case b: h = 60 * ((r - g) / d + 4); break;
     }
-
-    h /= 6;
   }
 
   return [h, s, v];
@@ -56,10 +54,10 @@ function set_color($image, color) {
   var hsv = hexColortoHSV(color);
 
   $image.css('filter',
-    // Convert to sepia (make sure H and V aren't 0) and make sure S and V are 100%
+    // Convert to sepia (make sure S and V aren't 0) and make sure S and V are 100%
     'invert(.5) sepia(1) saturate(100) brightness(100) '+
-    // Change to final color based on CSV color
-    'hue-rotate('+hsv[0]+'turn) saturate('+hsv[1]+') brightness('+hsv[2]+')'
+    // Change to final color based on HSV color
+    'hue-rotate('+hsv[0]+'deg) saturate('+hsv[1]+') brightness('+hsv[2]+')'
   );
 }
 
