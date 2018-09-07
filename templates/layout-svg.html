@@ -13,12 +13,13 @@
       <div id="layer-selector">
         <form action="#">
           {% for layer in layers %}
-          {% set css_name = layer.replace(".", "_")  %}
+          {% set css_name = layer['name'].replace(".", "_")  %}
+          {% set color = '#{:02X}{:02X}{:02X}'.format(layer['color'][0], layer['color'][1], layer['color'][2]) %}
           <div class=layer-options>
             <input name="top-layer" type="radio" value="{{css_name}}" checked>
-            <input name="{{css_name}}-color" type="color" value="#e66465" class="layer-color" />
-            <input name="{{css_name}}-visible" type="checkbox" class="layer-visible" checked>
-            <label for="{{css_name}}-visible">{{layer}}</label>
+            <input name="{{css_name}}-color" type="color" value="{{color}}" class="layer-color" />
+            <input name="{{css_name}}-visible" type="checkbox" class="layer-visible" {% if layer['visible'] %}checked{% endif %}>
+            <label for="{{css_name}}-visible">{{layer['name']}}</label>
           </div>
           {% endfor %}
         </form>
@@ -26,8 +27,8 @@
     </div>
     <div id="layout">
       {% for layer in layers %}
-      {% set css_name = layer.replace(".", "_")  %}
-      <img id="{{css_name}}" class="layer" src="{{svg_url}}&layer={{layer}}"></img>
+      {% set css_name = layer['name'].replace(".", "_")  %}
+      <img id="{{css_name}}" class="layer" src="{{svg_url}}&layer={{layer['name']}}"></img>
       {% endfor %}
     </div>
   </div>

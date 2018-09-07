@@ -322,7 +322,6 @@ def render_pdf_schematic(client_key, base_url, secret, repo, cset, file_path):
 	return send_file(pdf_file)
 
 def render_svg_layout(client_key, base_url, secret, repo, cset, file_path, layer):
-	print(file_path);
 	with requests.Session() as s:
 		get_and_save_file(s, client_key, base_url, secret, repo, cset, file_path)
 
@@ -334,7 +333,8 @@ def render_svg_layout(client_key, base_url, secret, repo, cset, file_path, layer
 		makedirs(directory)
 
 	with pcb_util.get_plotter(input_file, path.abspath(output_dir)) as plotter:
-		output_filename = plotter.plot(pcb_util.layer_from_name(layer), PLOT_FORMAT_SVG)
+		output_filename = plotter.plot(
+			pcb_util.layer_from_name(pcb_util.open_board(input_file), layer), PLOT_FORMAT_SVG)
 
 	print output_filename
 	return send_file(output_filename)
@@ -425,6 +425,22 @@ def schematic_pdf():
 def layout_svg():
 	username, repo_path, file_path, cset, access_token = validate_and_get_request_data()
 
+	pcb_file = INPUT_DIR.format(cset=cset, path=file_path)
+
+	# TODO: check if file exists
+	connection = get_connection(username)
+	client_key = connections_db.get(connection+"/client_key".format(username)).decode("utf-8")
+	base_url = connections_db.get(connection+"/api_url".format(username)).decode("utf-8")
+
+	nonce = b64decode(connections_db.get(connection+"/nonce"))
+	cipher = AES.new(b64decode(connections_db_key), AES.MODE_GCM, nonce=nonce)
+	secret = connections_db.get(connection+"/secret")
+	secret = cipher.decrypt(secret).decode("utf-8")
+	with requests.Session() as s:
+		get_and_save_file(s, client_key, base_url, secret, repo_path, cset, file_path)
+
+	layers = pcb_util.get_layers(pcb_file)
+
 	svg_url = ADDRESS+base+"/render/{}/{}/{}.svg?cset={}&access_token={}".format(
 		"bitbucket.org",
 		repo_path,
@@ -432,11 +448,6 @@ def layout_svg():
 		cset,
 		access_token
 	)
-	# TODO: figure out layers from file
-	layers = [
-		"F.Cu",
-		"B.Cu"
-	]
 	return render_template('layout-svg.html', svg_url=unquote(svg_url), layers=layers)
 
 @app.route('/static/<path:path>')
