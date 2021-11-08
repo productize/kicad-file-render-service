@@ -146,7 +146,7 @@ Wishlist
 - A home page
 - Run it as a service
 
-[KiCad]: http://kicad-pcb.org/
+[KiCad]: http://kicad.org/
 [github-1005]: https://github.com/isaacs/github/issues/1005
 [bitbucket-issue-13269]: https://bitbucket.org/site/master/issues/13269/add-an-extension-point-for-the-pull
 [letsencrypt]: https://letsencrypt.org/
